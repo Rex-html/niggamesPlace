@@ -1,1 +1,448 @@
-.
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Cubo Rosa — Sobrevive</title>
+<style>
+  :root{
+    --bg:#999;
+    --limit:#777;
+    --hud-bg: rgba(0,0,0,0.5);
+    font-family: system-ui, Arial, sans-serif;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);display:flex;align-items:center;justify-content:center;}
+  #gameWrap{width:900px;height:600px;background:linear-gradient(#a0a0a0,#8f8f8f);box-shadow:0 8px 30px rgba(0,0,0,0.4);position:relative;overflow:hidden;border:8px solid var(--limit);}
+  canvas{display:block;background:linear-gradient(90deg,#bdbdbd 0%, #9f9f9f 100%);width:100%;height:100%;}
+  #hud{position:absolute;left:12px;top:12px;padding:8px 12px;background:var(--hud-bg);color:#fff;border-radius:8px;font-weight:600;display:flex;gap:12px;align-items:center}
+  .life{width:18px;height:18px;background:#ff4da6;border-radius:3px;box-shadow:0 1px 0 rgba(0,0,0,0.2) inset}
+  #info{position:absolute;right:12px;top:12px;padding:8px 12px;background:var(--hud-bg);color:#fff;border-radius:8px;font-size:13px}
+  #gameOver{position:absolute;left:0;right:0;top:0;bottom:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);color:#fff;font-size:22px;flex-direction:column;gap:12px;display:none}
+  button{padding:8px 14px;border-radius:8px;border:0;background:#ff4da6;color:#fff;font-weight:700;cursor:pointer}
+  small{opacity:0.85;display:block;font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div>Vidas:</div>
+    <div id="livesContainer"></div>
+  </div>
+  <div id="info">
+    WASD: mover · Espacio: dash<br><small>Dash dura un breve instante, cooldown visible</small>
+  </div>
+  <div id="gameOver">
+    <div id="gameOverText">Game Over</div>
+    <button id="restartBtn">Reiniciar</button>
+  </div>
+</div>
+
+<script>
+/* Juego: Cubo rosa evita cubos blancos y balas amarillas
+   Autor: ChatGPT — versión simple y autocontenida
+*/
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const bounds = { x: 20, y: 20, w: canvas.width - 40, h: canvas.height - 40 };
+
+let keys = {};
+window.addEventListener('keydown', e => { if(e.code==='Space') e.preventDefault(); keys[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+const hudLives = document.getElementById('livesContainer');
+const gameOverScreen = document.getElementById('gameOver');
+const restartBtn = document.getElementById('restartBtn');
+restartBtn.onclick = resetGame;
+
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+
+let game;
+function newGame(){
+  game = {
+    player: {
+      x: canvas.width/2, y: canvas.height/2, size: 24,
+      speed: 160, vx:0, vy:0,
+      dashSpeed: 420, isDashing:false, dashTime:0, dashDuration:0.18, dashCooldown:0, dashCooldownMax:0.9,
+      invuln:0
+    },
+    whites: [],
+    bullets: [],
+    spawnTimer:0,
+    spawnInterval:2.0,
+    lives:3,
+    time:0
+  };
+  // initial whites
+  for(let i=0;i<5;i++) spawnWhite();
+  updateLivesHud();
+  gameOverScreen.style.display='none';
+}
+function resetGame(){
+  newGame();
+  last = performance.now();
+  loop(last);
+}
+
+function spawnWhite(){
+  // spawn on a random edge
+  const s = 28 + Math.random()*12;
+  let x,y;
+  const edge = Math.floor(Math.random()*4);
+  if(edge===0){ x = bounds.x + Math.random()*bounds.w; y = bounds.y - 40; }
+  if(edge===1){ x = bounds.x + bounds.w + 40; y = bounds.y + Math.random()*bounds.h; }
+  if(edge===2){ x = bounds.x + Math.random()*bounds.w; y = bounds.y + bounds.h + 40; }
+  if(edge===3){ x = bounds.x - 40; y = bounds.y + Math.random()*bounds.h; }
+  game.whites.push({
+    x,y,size: s,
+    speed: 70 + Math.random()*40,
+    shootCooldown: 1.5 + Math.random()*2.0,
+    shootTimer: 2.0 + Math.random()*1.5,
+    state: 'chase' // chase -> shoot -> chase ...
+  });
+}
+
+function updateLivesHud(){
+  hudLives.innerHTML = '';
+  for(let i=0;i<game.lives;i++){
+    const div = document.createElement('div');
+    div.className='life';
+    hudLives.appendChild(div);
+  }
+}
+
+function playerHit(){
+  if(game.player.invuln>0) return;
+  game.lives--;
+  updateLivesHud();
+  game.player.invuln = 1.2; // invulnerable after hit
+  // knockback a bit
+  game.player.vx = (Math.random()-0.5)*180;
+  game.player.vy = (Math.random()-0.5)*180;
+  if(game.lives<=0) {
+    // game over
+    gameOverScreen.style.display='flex';
+  }
+}
+
+function rectsCollide(a,b){
+  return Math.abs(a.x-b.x) < (a.size/2 + b.size/2) && Math.abs(a.y-b.y) < (a.size/2 + b.size/2);
+}
+
+// main loop
+let last = performance.now();
+newGame();
+loop(last);
+
+function loop(now){
+  const dt = Math.min(0.035, (now - last) / 1000);
+  last = now;
+  step(dt);
+  render();
+  if(game.lives>0) requestAnimationFrame(loop);
+}
+
+function step(dt){
+  game.time += dt;
+  const p = game.player;
+
+  // dash handling
+  p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+  if(keys[' '] || keys['space']) {
+    // for some browsers key is ' '
+  }
+  // read movement input (WASD)
+  let mx=0,my=0;
+  if(keys['w']) my -= 1;
+  if(keys['s']) my += 1;
+  if(keys['a']) mx -= 1;
+  if(keys['d']) mx += 1;
+  const mag = Math.hypot(mx,my) || 1;
+  mx /= mag; my /= mag;
+
+  // start dash on Space pressed (on down)
+  if((keys[' '] || keys['space']) && p.dashCooldown <= 0 && !p.isDashing){
+    p.isDashing = true;
+    p.dashTime = 0;
+    p.dashCooldown = p.dashCooldownMax;
+    // dash direction: current movement if any, else last velocity
+    if(Math.abs(mx) + Math.abs(my) > 0.01){
+      p.vx = mx * p.dashSpeed;
+      p.vy = my * p.dashSpeed;
+    } else {
+      // dash forward in last movement direction, or up if none
+      if(Math.hypot(p.vx,p.vy) > 1){
+        const m = Math.hypot(p.vx,p.vy);
+        p.vx = (p.vx/m) * p.dashSpeed;
+        p.vy = (p.vy/m) * p.dashSpeed;
+      } else {
+        p.vy = -p.dashSpeed;
+      }
+    }
+  }
+
+  if(p.isDashing){
+    p.dashTime += dt;
+    if(p.dashTime >= p.dashDuration) {
+      p.isDashing = false;
+      // reduce velocity to normal movement
+      p.vx = 0; p.vy = 0;
+    }
+  } else {
+    // normal movement velocity (interpolated for smoothness)
+    const targetVx = mx * p.speed;
+    const targetVy = my * p.speed;
+    // simple smoothing
+    p.vx += (targetVx - p.vx) * clamp(dt*10,0,1);
+    p.vy += (targetVy - p.vy) * clamp(dt*10,0,1);
+  }
+
+  // apply velocity to position
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+
+  // keep inside bounds
+  const half = p.size/2;
+  p.x = clamp(p.x, bounds.x + half, bounds.x + bounds.w - half);
+  p.y = clamp(p.y, bounds.y + half, bounds.y + bounds.h - half);
+
+  // invulnerability timer
+  if(p.invuln > 0) p.invuln = Math.max(0, p.invuln - dt);
+
+  // spawn whites over time
+  game.spawnTimer += dt;
+  if(game.spawnTimer >= game.spawnInterval){
+    game.spawnTimer = 0;
+    // slowly increase spawn frequency
+    game.spawnInterval = Math.max(0.8, game.spawnInterval - 0.02);
+    spawnWhite();
+  }
+
+  // update whites
+  for(let i = game.whites.length - 1; i >= 0; i--){
+    const w = game.whites[i];
+    // behavior: chase player; every shootTimer -> stop, shoot a few bullets, then continue
+    const toPlayer = { x: game.player.x - w.x, y: game.player.y - w.y };
+    const d = Math.hypot(toPlayer.x, toPlayer.y) || 1;
+    // normalized
+    const nx = toPlayer.x / d;
+    const ny = toPlayer.y / d;
+
+    if(w.state === 'chase'){
+      // move toward player
+      w.x += nx * w.speed * dt;
+      w.y += ny * w.speed * dt;
+      w.shootTimer -= dt;
+      if(w.shootTimer <= 0){
+        w.state = 'prepareShoot';
+        w.shootTimer = 0.5; // brief prepare time
+      }
+    } else if(w.state === 'prepareShoot'){
+      w.shootTimer -= dt;
+      if(w.shootTimer <= 0){
+        // fire a burst of small bullets toward player
+        fireBulletsFrom(w, 6, 220);
+        w.state = 'cooldown';
+        w.shootTimer = 1.2 + Math.random()*1.6; // time before next prepare
+      }
+    } else if(w.state === 'cooldown'){
+      // continue chasing but will not shoot until shootTimer finished
+      w.x += nx * w.speed * dt * 0.9;
+      w.y += ny * w.speed * dt * 0.9;
+      w.shootTimer -= dt;
+      if(w.shootTimer <= 0){
+        w.state = 'chase';
+        w.shootTimer = 2.0 + Math.random()*1.5;
+      }
+    }
+
+    // keep whites not infinitely far
+    w.x = clamp(w.x, bounds.x - 80, bounds.x + bounds.w + 80);
+    w.y = clamp(w.y, bounds.y - 80, bounds.y + bounds.h + 80);
+
+    // collision with player
+    const whiteRect = { x:w.x, y:w.y, size:w.size };
+    const playerRect = { x:p.x, y:p.y, size:p.size };
+    if(rectsCollide(whiteRect, playerRect)){
+      if(p.isDashing){
+        // eliminate white
+        game.whites.splice(i,1);
+        continue;
+      } else {
+        playerHit();
+        // push white away a bit
+        const angle = Math.atan2(w.y - p.y, w.x - p.x);
+        w.x += Math.cos(angle) * 18;
+        w.y += Math.sin(angle) * 18;
+      }
+    }
+  }
+
+  // update bullets
+  for(let i = game.bullets.length - 1; i >= 0; i--){
+    const b = game.bullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if(b.life <= 0) { game.bullets.splice(i,1); continue; }
+
+    // bullet out of bounds
+    if(b.x < bounds.x - 40 || b.x > bounds.x + bounds.w + 40 || b.y < bounds.y - 40 || b.y > bounds.y + bounds.h + 40){
+      game.bullets.splice(i,1);
+      continue;
+    }
+
+    // collision with player
+    const pr = { x:p.x, y:p.y, size:p.size };
+    const br = { x:b.x, y:b.y, size:b.size };
+    if(rectsCollide(pr, br)){
+      // if player dashing maybe avoid? requirement: hit by yellow bullet reduces life
+      playerHit();
+      game.bullets.splice(i,1);
+      continue;
+    }
+  }
+
+  // small friction to velocity when not moving
+  p.vx *= 0.995;
+  p.vy *= 0.995;
+}
+
+function fireBulletsFrom(owner, count, speed){
+  // shoot towards player but spread in arc
+  const angleToPlayer = Math.atan2(game.player.y - owner.y, game.player.x - owner.x);
+  const spread = 0.9; // radians
+  for(let i=0;i<count;i++){
+    const a = angleToPlayer + (i - (count-1)/2) * (spread / (count-1));
+    game.bullets.push({
+      x: owner.x + Math.cos(a)*(owner.size/2+6),
+      y: owner.y + Math.sin(a)*(owner.size/2+6),
+      vx: Math.cos(a) * speed,
+      vy: Math.sin(a) * speed,
+      size: 8,
+      life: 4.0,
+      color: '#ffd84d'
+    });
+  }
+}
+
+function render(){
+  // clear
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // background grid (cube-like feel)
+  const tile = 40;
+  ctx.save();
+  ctx.translate(bounds.x, bounds.y);
+  ctx.fillStyle = '#b6b6b6';
+  for(let x=0;x<bounds.w; x+=tile){
+    ctx.fillRect(x, 0, 1, bounds.h);
+  }
+  for(let y=0;y<bounds.h; y+=tile){
+    ctx.fillRect(0, y, bounds.w, 1);
+  }
+  ctx.restore();
+
+  // draw bounds border (thicker)
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(bounds.x, bounds.y, bounds.w, bounds.h);
+
+  // draw whites (white cubes)
+  for(const w of game.whites){
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    // slight shading
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(-w.size/2, -w.size/2, w.size, w.size);
+    ctx.strokeStyle = '#d0d0d0';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-w.size/2, -w.size/2, w.size, w.size);
+    // eyes (simple)
+    ctx.fillStyle = '#222';
+    ctx.fillRect(-w.size*0.15 - 4, -4, 6, 6);
+    ctx.fillRect(w.size*0.15 - 2, -4, 6, 6);
+    ctx.restore();
+  }
+
+  // draw bullets
+  for(const b of game.bullets){
+    ctx.fillStyle = b.color || '#ff0';
+    ctx.fillRect(b.x - b.size/2, b.y - b.size/2, b.size, b.size);
+  }
+
+  // draw player (pink cube)
+  const p = game.player;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  // invuln blinking
+  if(p.invuln > 0 && Math.floor(p.invuln * 8) % 2 === 0){
+    ctx.globalAlpha = 0.35;
+  } else { ctx.globalAlpha = 1; }
+  // cube
+  ctx.fillStyle = '#ff66b3';
+  ctx.fillRect(-p.size/2, -p.size/2, p.size, p.size);
+  ctx.strokeStyle = '#e05599';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-p.size/2, -p.size/2, p.size, p.size);
+  // dash halo
+  if(p.isDashing){
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(-p.size/2 - 6, -p.size/2 - 6, p.size + 12, p.size + 12);
+  }
+  ctx.restore();
+
+  // HUD dash cooldown indicator
+  const hudX = 140, hudY = 12;
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(hudX, hudY, 120, 12);
+  const pct = 1 - (game.player.dashCooldown / game.player.dashCooldownMax);
+  ctx.fillStyle = '#ffe07a';
+  ctx.fillRect(hudX+2, hudY+2, Math.max(0, Math.min(116, 116 * pct)), 8);
+  ctx.strokeStyle = '#0003';
+  ctx.strokeRect(hudX, hudY, 120, 12);
+
+  // lives drawn already as DOM; add textual hint
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px system-ui, Arial';
+  ctx.fillText('Dash', hudX - 40, hudY+10);
+
+  // optional debug (count)
+  ctx.fillStyle = '#222';
+  ctx.font = '13px system-ui, Arial';
+  ctx.fillText('Cubos enemigos: ' + game.whites.length, 12, canvas.height - 14);
+  ctx.fillText('Balas: ' + game.bullets.length, 170, canvas.height - 14);
+}
+
+// restart loop when restarting
+function loopRestart(){
+  if(game.lives > 0) return;
+  last = performance.now();
+  loop(last);
+}
+
+// restart on button
+restartBtn.addEventListener('click', () => {
+  newGame();
+  last = performance.now();
+  loop(last);
+});
+
+// start the first frame
+last = performance.now();
+loop(last);
+
+</script>
+</body>
+</html>
